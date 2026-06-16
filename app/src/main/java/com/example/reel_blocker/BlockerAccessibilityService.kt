@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.media.AudioManager
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -17,64 +18,104 @@ class BlockerAccessibilityService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     private var overlayView: FrameLayout? = null
     private var isOverlayShown = false
+    private var audioManager: AudioManager? = null
     private lateinit var prefs: SharedPreferences
 
-    // These are the UI node keywords that appear when Reels/Shorts are on screen
-    private val BLOCK_SIGNALS = listOf(
-        // Instagram Reels
-        "reel_viewer", "clips_tab", "reels_tray",
-        "ReelsFragment", "IgReelsTray",
-        // YouTube Shorts
-        "shorts_shelf", "ShortsVideoPlayerView",
-        "shortsContainer", "reel_player_page"
+    private val SHORTS_PLAYER_SIGNALS = listOf(
+        "reel_player_page",
+        "ShortsVideoPlayerView",
+        "shortsContainer",
+        "shorts_container"
+    )
+
+    private val SHORTS_SHELF_SIGNALS = listOf(
+        "shorts_shelf"
+    )
+
+    private val INSTAGRAM_REELS_SIGNALS = listOf(
+        "reel_viewer",
+        "clips_tab",
+        "reels_tray",
+        "ReelsFragment",
+        "IgReelsTray"
     )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         prefs = getSharedPreferences("blocker_prefs", Context.MODE_PRIVATE)
+    }
+
+    // Returns true if user has temporarily allowed Shorts/Reels
+    private fun isTemporarilyAllowed(): Boolean {
+        val allowUntil = prefs.getLong("allow_until", 0)
+        return System.currentTimeMillis() < allowUntil
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
 
-        // Only watch Instagram and YouTube
-        if (pkg !in listOf("com.instagram.android", "com.google.android.youtube")) {
+        // If user allowed temporarily (for shared links) — do nothing
+        if (isTemporarilyAllowed()) {
             removeOverlay()
             return
         }
 
-        // If user launched from a shared link — allow it
-        if (prefs.getBoolean("launched_from_share", false)) {
-            removeOverlay()
-            return
+        when (pkg) {
+            "com.google.android.youtube" -> handleYouTube()
+            "com.instagram.android" -> handleInstagram()
+            else -> removeOverlay()
         }
+    }
 
+    private fun handleYouTube() {
         val root = rootInActiveWindow ?: return
-        val detected = containsBlockSignal(root)
 
-        if (detected) {
+        // Short is actually playing — go back immediately
+        if (containsSignals(root, SHORTS_PLAYER_SIGNALS)) {
+            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            removeOverlay()
+            return
+        }
+
+        // Shorts shelf in home feed — cover visually
+        if (containsSignals(root, SHORTS_SHELF_SIGNALS)) {
             showOverlay()
         } else {
             removeOverlay()
         }
     }
 
-    private fun containsBlockSignal(node: AccessibilityNodeInfo): Boolean {
+    private fun handleInstagram() {
+        val root = rootInActiveWindow ?: return
+
+        if (containsSignals(root, INSTAGRAM_REELS_SIGNALS)) {
+            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            removeOverlay()
+        } else {
+            removeOverlay()
+        }
+    }
+
+    private fun containsSignals(node: AccessibilityNodeInfo, signals: List<String>): Boolean {
         val viewId = node.viewIdResourceName ?: ""
         val text = node.text?.toString() ?: ""
         val className = node.className?.toString() ?: ""
 
-        if (BLOCK_SIGNALS.any {
+        if (signals.any {
             viewId.contains(it, ignoreCase = true) ||
             text.contains(it, ignoreCase = true) ||
             className.contains(it, ignoreCase = true)
         }) return true
 
-        // Recursively check child nodes
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (containsBlockSignal(child)) return true
+            if (containsSignals(child, signals)) return true
         }
         return false
     }
@@ -83,11 +124,11 @@ class BlockerAccessibilityService : AccessibilityService() {
         if (isOverlayShown) return
 
         overlayView = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#F0000000"))
+            setBackgroundColor(Color.parseColor("#CC000000"))
         }
 
         val message = TextView(this).apply {
-            text = "🚫 Reels & Shorts are blocked\n\nAsk a friend to share one with you"
+            text = "🚫 Shorts are blocked"
             setTextColor(Color.WHITE)
             textSize = 18f
             gravity = Gravity.CENTER
@@ -103,7 +144,9 @@ class BlockerAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         )
 
