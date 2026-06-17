@@ -47,75 +47,93 @@ class BlockerAccessibilityService : AccessibilityService() {
         prefs = getSharedPreferences("blocker_prefs", Context.MODE_PRIVATE)
     }
 
-    // Returns true if user has temporarily allowed Shorts/Reels
     private fun isTemporarilyAllowed(): Boolean {
         val allowUntil = prefs.getLong("allow_until", 0)
         return System.currentTimeMillis() < allowUntil
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = event?.packageName?.toString() ?: return
+        try {
+            val pkg = event?.packageName?.toString() ?: return
 
-        // If user allowed temporarily (for shared links) — do nothing
-        if (isTemporarilyAllowed()) {
-            removeOverlay()
-            return
-        }
+            if (isTemporarilyAllowed()) {
+                removeOverlay()
+                return
+            }
 
-        when (pkg) {
-            "com.google.android.youtube" -> handleYouTube()
-            "com.instagram.android" -> handleInstagram()
-            else -> removeOverlay()
+            when (pkg) {
+                "com.google.android.youtube" -> handleYouTube()
+                "com.instagram.android" -> handleInstagram()
+                else -> removeOverlay()
+            }
+        } catch (e: Exception) {
+            // Never let an exception here crash/freeze the service
+            e.printStackTrace()
         }
     }
 
     private fun handleYouTube() {
         val root = rootInActiveWindow ?: return
+        try {
+            if (containsSignals(root, SHORTS_PLAYER_SIGNALS)) {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                removeOverlay()
+                return
+            }
 
-        // Short is actually playing — go back immediately
-        if (containsSignals(root, SHORTS_PLAYER_SIGNALS)) {
-            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            removeOverlay()
-            return
-        }
-
-        // Shorts shelf in home feed — cover visually
-        if (containsSignals(root, SHORTS_SHELF_SIGNALS)) {
-            showOverlay()
-        } else {
-            removeOverlay()
+            if (containsSignals(root, SHORTS_SHELF_SIGNALS)) {
+                showOverlay()
+            } else {
+                removeOverlay()
+            }
+        } finally {
+            root.recycle()
         }
     }
 
     private fun handleInstagram() {
         val root = rootInActiveWindow ?: return
-
-        if (containsSignals(root, INSTAGRAM_REELS_SIGNALS)) {
-            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            removeOverlay()
-        } else {
-            removeOverlay()
+        try {
+            if (containsSignals(root, INSTAGRAM_REELS_SIGNALS)) {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                removeOverlay()
+            } else {
+                removeOverlay()
+            }
+        } finally {
+            root.recycle()
         }
     }
 
-    private fun containsSignals(node: AccessibilityNodeInfo, signals: List<String>): Boolean {
+    // depth limit avoids ANR / freeze on extremely deep or cyclic view trees
+    // child nodes are recycled to avoid memory leaks over long sessions
+    private fun containsSignals(
+        node: AccessibilityNodeInfo,
+        signals: List<String>,
+        depth: Int = 0
+    ): Boolean {
+        if (depth > 25) return false
+
         val viewId = node.viewIdResourceName ?: ""
         val text = node.text?.toString() ?: ""
         val className = node.className?.toString() ?: ""
 
-        if (signals.any {
+        val matched = signals.any {
             viewId.contains(it, ignoreCase = true) ||
             text.contains(it, ignoreCase = true) ||
             className.contains(it, ignoreCase = true)
-        }) return true
+        }
+        if (matched) return true
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (containsSignals(child, signals)) return true
+            val found = containsSignals(child, signals, depth + 1)
+            child.recycle()
+            if (found) return true
         }
         return false
     }
